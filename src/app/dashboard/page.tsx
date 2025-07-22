@@ -60,6 +60,7 @@ const Dashboard = () => {
   const auth = useAuth();
   const [users, setUsers] = useState<AppUser[]>([]);
   const [currentUserRole, setCurrentUserRole] = useState<Role>('user');
+  const [currentUserPermissions, setCurrentUserPermissions] = useState<UserPermission[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState<Role | ''>('');
@@ -67,11 +68,57 @@ const Dashboard = () => {
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [selectedUser, setSelectedUser] = useState<AppUser | null>(null);
   const [showPermissions, setShowPermissions] = useState(false);
+  const [showMyPermissions, setShowMyPermissions] = useState(false);
   const [allPermissions, setAllPermissions] = useState<Permission[]>([]);
+  const [allPermissionsLoaded, setAllPermissionsLoaded] = useState(false);
   const [userPermissions, setUserPermissions] = useState<UserPermission[]>([]);
   const [permissionLoading, setPermissionLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<'users' | 'permissions'>('users');
   const usersPerPage = 5;
+
+  // Fetch current user's permissions
+  const fetchCurrentUserPermissions = React.useCallback(async () => {
+    if (!auth?.user?.id) return;
+    
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      const response = await fetch(`/api/admin/permissions/user?userId=${auth.user.id}`, {
+        headers: {
+          'Authorization': `Bearer ${session?.access_token}`,
+        },
+      });
+      
+      const result = await response.json();
+      
+      if (response.ok) {
+        setCurrentUserPermissions(result.userPermissions || []);
+      }
+    } catch (error) {
+      console.error('Error fetching current user permissions:', error);
+    }
+  }, [auth?.user?.id]);
+
+  // Check if current user has a specific permission
+  const hasUserPermission = React.useCallback((permissionName: string): boolean => {
+    // Super admin has all permissions
+    if (currentUserRole === 'super_admin') return true;
+    
+    // Check if user has the specific permission granted
+    return currentUserPermissions.some(up => up.permissions.name === permissionName);
+  }, [currentUserRole, currentUserPermissions]);
+
+  // Enhanced permission checking that combines role-based and granular permissions
+  const canPerformAction = React.useCallback((action: string): boolean => {
+    // Super admin can do everything
+    if (currentUserRole === 'super_admin') return true;
+    
+    // Check specific permission first
+    if (hasUserPermission(action)) return true;
+    
+    // Fallback to role-based permissions for backward compatibility
+    return hasPermission(currentUserRole, action);
+  }, [currentUserRole, hasUserPermission]);
 
   const fetchUsers = React.useCallback(async () => {
     if (!auth?.user || auth.loading) {
@@ -119,12 +166,14 @@ const Dashboard = () => {
     setLoading(false);
   }, [auth?.user, auth?.loading, users.length]);
 
-  const fetchUserPermissions = async (userId: string) => {
-    setPermissionLoading(true);
+  // Fetch all permissions once and cache them
+  const fetchAllPermissions = React.useCallback(async () => {
+    if (allPermissionsLoaded) return;
+    
     try {
       const { data: { session } } = await supabase.auth.getSession();
       
-      const response = await fetch(`/api/admin/permissions?userId=${userId}`, {
+      const response = await fetch('/api/admin/permissions/all', {
         headers: {
           'Authorization': `Bearer ${session?.access_token}`,
         },
@@ -133,19 +182,75 @@ const Dashboard = () => {
       const result = await response.json();
       
       if (response.ok) {
-        setAllPermissions(result.allPermissions || []);
+        setAllPermissions(result.permissions || []);
+        setAllPermissionsLoaded(true);
+      } else {
+        console.error('Failed to fetch all permissions:', result.error);
+      }
+    } catch (error) {
+      console.error('Error fetching all permissions:', error);
+    }
+  }, [allPermissionsLoaded]);
+
+  const fetchUserPermissions = React.useCallback(async (userId: string) => {
+    setPermissionLoading(true);
+    
+    // Ensure all permissions are loaded first
+    if (!allPermissionsLoaded) {
+      await fetchAllPermissions();
+    }
+    
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      const response = await fetch(`/api/admin/permissions/user?userId=${userId}`, {
+        headers: {
+          'Authorization': `Bearer ${session?.access_token}`,
+        },
+      });
+      
+      const result = await response.json();
+      
+      if (response.ok) {
         setUserPermissions(result.userPermissions || []);
       } else {
-        toast.error(result.error || 'Failed to fetch permissions');
+        toast.error(result.error || 'Failed to fetch user permissions');
       }
-    } catch (err) {
-      toast.error('Failed to fetch permissions');
-      console.error('Error fetching permissions:', err);
+    } catch (error) {
+      toast.error('Failed to fetch user permissions');
+      console.error('Error fetching user permissions:', error);
     }
     setPermissionLoading(false);
-  };
+  }, [allPermissionsLoaded, fetchAllPermissions]);
 
   const handlePermissionChange = async (userId: string, permissionId: string, granted: boolean) => {
+    // Optimistic update for better UX
+    const optimisticUpdate = (prev: UserPermission[]) => {
+      if (granted) {
+        // Add permission optimistically
+        const permission = allPermissions.find(p => p.id === permissionId);
+        if (permission) {
+          return [...prev, {
+            permission_id: permissionId,
+            granted_by: auth?.user?.id || '',
+            granted_at: new Date().toISOString(),
+            permissions: {
+              name: permission.name,
+              description: permission.description,
+              category: permission.category
+            }
+          }];
+        }
+      } else {
+        // Remove permission optimistically
+        return prev.filter(up => up.permission_id !== permissionId);
+      }
+      return prev;
+    };
+
+    // Apply optimistic update
+    setUserPermissions(optimisticUpdate);
+
     try {
       const { data: { session } } = await supabase.auth.getSession();
       
@@ -162,19 +267,51 @@ const Dashboard = () => {
       
       if (response.ok) {
         toast.success(`Permission ${granted ? 'granted' : 'revoked'} successfully`);
-        // Refresh permissions
+        // Refresh only user permissions, not all permissions
         await fetchUserPermissions(userId);
       } else {
         toast.error(result.error || `Failed to ${granted ? 'grant' : 'revoke'} permission`);
+        // Revert optimistic update on error
+        setUserPermissions(prev => 
+          granted 
+            ? prev.filter(up => up.permission_id !== permissionId)
+            : [...prev, {
+                permission_id: permissionId,
+                granted_by: auth?.user?.id || '',
+                granted_at: new Date().toISOString(),
+                permissions: allPermissions.find(p => p.id === permissionId) || { name: '', description: '', category: '' }
+              }]
+        );
       }
-    } catch (err) {
+    } catch (error) {
       toast.error('An unexpected error occurred');
-      console.error('Error updating permission:', err);
+      console.error('Error updating permission:', error);
+      // Revert optimistic update on error
+      setUserPermissions(prev => 
+        granted 
+          ? prev.filter(up => up.permission_id !== permissionId)
+          : [...prev, {
+              permission_id: permissionId,
+              granted_by: auth?.user?.id || '',
+              granted_at: new Date().toISOString(),
+              permissions: allPermissions.find(p => p.id === permissionId) || { name: '', description: '', category: '' }
+            }]
+      );
     }
   };
 
   useEffect(() => {
     fetchUsers();
+    
+    // Fetch current user's permissions
+    if (auth?.user?.id) {
+      fetchCurrentUserPermissions();
+    }
+
+    // Preload all permissions for better UX
+    if (currentUserRole === 'super_admin') {
+      fetchAllPermissions();
+    }
 
     const subscription = supabase
       .channel('rbac_users_changes')
@@ -200,6 +337,8 @@ const Dashboard = () => {
               console.log('Current user role updated via real-time:', payload.new.role);
               setCurrentUserRole(payload.new.role);
               auth?.refreshUser?.();
+              // Refresh current user permissions when role changes
+              fetchCurrentUserPermissions();
             }
           } else if (payload.eventType === 'DELETE') {
             setUsers(prevUsers => 
@@ -218,7 +357,7 @@ const Dashboard = () => {
     return () => {
       subscription.unsubscribe();
     };
-  }, [auth, fetchUsers]);
+  }, [auth, fetchUsers, currentUserRole, fetchAllPermissions, fetchCurrentUserPermissions]);
 
   const filteredUsers = users
     .filter((u) => u.email.toLowerCase().includes(search.toLowerCase()))
@@ -231,8 +370,29 @@ const Dashboard = () => {
   const handleRoleChange = async (userId: string, newRole: Role) => {
     console.log(`Attempting to change user ${userId} role to ${newRole}`);
     
-    if (!canManageRole(currentUserRole, newRole)) {
+    // Check if user has permission to assign this specific role
+    const canAssignRole = () => {
+      switch (newRole) {
+        case 'super_admin':
+          return canPerformAction('assign_super_admin_role');
+        case 'admin':
+          return canPerformAction('assign_admin_role');
+        case 'moderator':
+          return canPerformAction('assign_moderator_role');
+        case 'user':
+          return canPerformAction('assign_user_role');
+        default:
+          return false;
+      }
+    };
+
+    if (!canAssignRole()) {
       toast.error(`You don't have permission to assign ${newRole} role`);
+      return;
+    }
+
+    if (!canManageRole(currentUserRole, newRole)) {
+      toast.error(`You don't have permission to assign ${newRole} role to this user`);
       return;
     }
 
@@ -374,9 +534,20 @@ const Dashboard = () => {
               <h1 className="text-4xl font-bold text-white mb-4">
                 {formatRoleName(currentUserRole)} Dashboard
               </h1>
-              <p className="text-white/80 text-lg max-w-2xl mx-auto">
+              <p className="text-white/80 text-lg max-w-2xl mx-auto mb-6">
                 Manage users, roles, and permissions with comprehensive access control
               </p>
+              
+              {/* My Permissions Button */}
+              <button
+                onClick={() => setShowMyPermissions(true)}
+                className="inline-flex items-center px-6 py-3 bg-white/10 backdrop-blur-sm border border-white/20 rounded-lg text-white hover:bg-white/20 transition-all duration-200 font-medium"
+              >
+                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                </svg>
+                My Permissions ({currentUserPermissions.length})
+              </button>
             </div>
           </div>
         </div>
@@ -518,9 +689,11 @@ const Dashboard = () => {
                     {/* Actions */}
                     <div className="space-y-3">
                       {/* Role Selection */}
-                      {(currentUserRole === 'super_admin' || 
-                        (currentUserRole === 'admin' && user.role !== 'super_admin' && user.role !== 'admin') ||
-                        (currentUserRole === 'moderator' && user.role === 'user')) && (
+                      {(canPerformAction('assign_user_role') || 
+                        canPerformAction('assign_moderator_role') || 
+                        canPerformAction('assign_admin_role') || 
+                        canPerformAction('assign_super_admin_role')) && 
+                       canManageRole(currentUserRole, user.role) && (
                         <div>
                           <label className="block text-sm font-medium text-gray-700 mb-2">Change Role</label>
                           <select
@@ -529,36 +702,34 @@ const Dashboard = () => {
                             className="w-full px-3 py-2 border border-gray-300 rounded-lg text-gray-900 focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
                             disabled={user.id === auth?.user?.id}
                           >
-                            {currentUserRole === 'super_admin' && (
-                              <>
-                                <option value="super_admin">Super Admin</option>
-                                <option value="admin">Admin</option>
-                                <option value="moderator">Moderator</option>
-                                <option value="user">User</option>
-                              </>
+                            {/* Super Admin role - only super admins can assign */}
+                            {canPerformAction('assign_super_admin_role') && (
+                              <option value="super_admin">Super Admin</option>
                             )}
-                            {currentUserRole === 'admin' && (
-                              <>
-                                <option value="super_admin" disabled>Super Admin</option>
-                                <option value="admin" disabled>Admin</option>
-                                <option value="moderator">Moderator</option>
-                                <option value="user">User</option>
-                              </>
+                            
+                            {/* Admin role - super admins and those with assign_admin_role permission */}
+                            {canPerformAction('assign_admin_role') && (
+                              <option value="admin">Admin</option>
                             )}
-                            {currentUserRole === 'moderator' && (
-                              <>
-                                <option value="super_admin" disabled>Super Admin</option>
-                                <option value="admin" disabled>Admin</option>
-                                <option value="moderator" disabled>Moderator</option>
-                                <option value="user">User</option>
-                              </>
+                            
+                            {/* Moderator role - admins and above, or those with assign_moderator_role permission */}
+                            {canPerformAction('assign_moderator_role') && (
+                              <option value="moderator">Moderator</option>
+                            )}
+                            
+                            {/* User role - most roles can assign this */}
+                            {canPerformAction('assign_user_role') && (
+                              <option value="user">User</option>
                             )}
                           </select>
                         </div>
                       )}
 
-                      {/* View Only for Users */}
-                      {currentUserRole === 'user' && (
+                      {/* View Only for Users without permissions */}
+                      {!canPerformAction('assign_user_role') && 
+                       !canPerformAction('assign_moderator_role') && 
+                       !canPerformAction('assign_admin_role') && 
+                       !canPerformAction('assign_super_admin_role') && (
                         <div className="text-center py-2">
                           <span className="text-sm text-gray-500 bg-gray-100 px-3 py-1 rounded-lg">View Only Access</span>
                         </div>
@@ -566,8 +737,8 @@ const Dashboard = () => {
 
                       {/* Action Buttons */}
                       <div className="flex gap-2 pt-2">
-                        {/* Permissions Button */}
-                        {currentUserRole === 'super_admin' && (
+                        {/* Permissions Button - only for super admins or those with grant_permissions */}
+                        {(canPerformAction('grant_permissions') || canPerformAction('revoke_permissions')) && (
                           <button
                             onClick={() => openPermissionsModal(user)}
                             className="flex-1 bg-gradient-to-r from-blue-500 to-blue-600 text-white px-4 py-2 rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all duration-200 text-sm font-medium flex items-center justify-center"
@@ -579,8 +750,8 @@ const Dashboard = () => {
                           </button>
                         )}
 
-                        {/* Delete Button */}
-                        {(currentUserRole === 'super_admin' || currentUserRole === 'admin') && 
+                        {/* Delete Button - only for those with delete_users permission */}
+                        {canPerformAction('delete_users') && 
                          canManageRole(currentUserRole, user.role) && 
                          user.id !== auth?.user?.id && (
                           <button
@@ -665,6 +836,13 @@ const Dashboard = () => {
                     <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
                     <p className="text-gray-600">Loading permissions...</p>
                   </div>
+                ) : allPermissions.length === 0 ? (
+                  <div className="text-center py-12">
+                    <svg className="w-16 h-16 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                    </svg>
+                    <p className="text-gray-600">No permissions available</p>
+                  </div>
                 ) : (
                   <div className="space-y-6">
                     {['user_management', 'role_management', 'permission_management', 'system'].map(category => {
@@ -698,6 +876,131 @@ const Dashboard = () => {
                         </div>
                       );
                     })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* My Permissions Modal */}
+        {showMyPermissions && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-hidden">
+              {/* Modal Header */}
+              <div className={`bg-gradient-to-r ${getRoleColor(currentUserRole)} p-6`}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">My Permissions</h2>
+                    <p className="text-white/80">
+                      Your current role: {formatRoleName(currentUserRole)}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setShowMyPermissions(false)}
+                    className="text-white hover:text-gray-200 transition-colors"
+                  >
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+
+              {/* Modal Content */}
+              <div className="p-6 max-h-[calc(90vh-120px)] overflow-y-auto">
+                {currentUserRole === 'super_admin' ? (
+                  <div className="text-center py-12">
+                    <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <svg className="w-8 h-8 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                      </svg>
+                    </div>
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">All Permissions Granted</h3>
+                    <p className="text-gray-600 mb-4">
+                      As a Super Admin, you have access to all features and permissions in the system.
+                    </p>
+                    <div className="inline-flex items-center px-4 py-2 bg-purple-100 text-purple-800 rounded-lg">
+                      <svg className="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                      </svg>
+                      Unlimited Access
+                    </div>
+                  </div>
+                ) : currentUserPermissions.length === 0 ? (
+                  <div className="text-center py-12">
+                    <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                    </div>
+                    <h3 className="text-lg font-medium text-gray-900 mb-2">No Special Permissions</h3>
+                    <p className="text-gray-600">
+                      You currently have only the default permissions for your role: {formatRoleName(currentUserRole)}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+                      <div className="flex items-center">
+                        <svg className="w-5 h-5 text-blue-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <p className="text-blue-800 font-medium">
+                          You have {currentUserPermissions.length} special permission{currentUserPermissions.length !== 1 ? 's' : ''} beyond your role
+                        </p>
+                      </div>
+                    </div>
+
+                    {['user_management', 'role_management', 'permission_management', 'system'].map(category => {
+                      const categoryPermissions = currentUserPermissions.filter(up => up.permissions.category === category);
+                      if (categoryPermissions.length === 0) return null;
+
+                      return (
+                        <div key={category} className="border border-gray-200 rounded-xl p-4">
+                          <h3 className="text-lg font-semibold text-gray-900 mb-4 capitalize flex items-center">
+                            <span className="w-3 h-3 bg-green-500 rounded-full mr-2"></span>
+                            {category.replace('_', ' ')} Permissions
+                          </h3>
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {categoryPermissions.map(userPermission => (
+                              <div key={userPermission.permission_id} className="flex items-start space-x-3 p-3 bg-green-50 rounded-lg border border-green-200">
+                                <div className="flex-shrink-0 mt-1">
+                                  <svg className="w-4 h-4 text-green-600" fill="currentColor" viewBox="0 0 20 20">
+                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                  </svg>
+                                </div>
+                                <div className="flex-1">
+                                  <div className="text-sm font-medium text-gray-900">{userPermission.permissions.name}</div>
+                                  <div className="text-sm text-gray-600">{userPermission.permissions.description}</div>
+                                  <div className="text-xs text-gray-500 mt-1">
+                                    Granted: {new Date(userPermission.granted_at).toLocaleDateString()}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    {/* Role-based permissions info */}
+                    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                      <h3 className="text-lg font-semibold text-gray-900 mb-3 flex items-center">
+                        <span className="w-3 h-3 bg-blue-500 rounded-full mr-2"></span>
+                        Default Role Permissions
+                      </h3>
+                      <p className="text-sm text-gray-600 mb-3">
+                        As a {formatRoleName(currentUserRole)}, you also have these default permissions:
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {rolePermissions[currentUserRole]?.map(permission => (
+                          <span key={permission} className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-lg">
+                            {permission}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
