@@ -8,6 +8,52 @@ import toast from 'react-hot-toast';
 import { useAuth } from '@/components/auth-provider';
 import { supabase } from '@/lib/supabase';
 
+// Permission checking functions
+const rolePermissions: Record<Role, string[]> = {
+  super_admin: ['*'], // All permissions
+  admin: [
+    'view_users', 'create_users', 'edit_users', 'delete_users',
+    'view_roles', 'assign_user_role', 'assign_moderator_role',
+    'view_permissions', 'grant_permissions', 'revoke_permissions',
+    'manage_moderator_permissions', 'access_admin_panel'
+  ],
+  moderator: [
+    'view_users', 'edit_users',
+    'view_roles', 'assign_user_role',
+    'view_permissions', 'access_moderator_panel'
+  ],
+  user: ['view_users', 'view_roles']
+};
+
+function hasPermission(userRole: Role, permission: string): boolean {
+  if (userRole === 'super_admin') return true;
+  return rolePermissions[userRole]?.includes(permission) || false;
+}
+
+function canManageRole(currentRole: Role, targetRole: Role): boolean {
+  if (currentRole === 'super_admin') return true;
+  if (currentRole === 'admin') {
+    return targetRole !== 'super_admin' && targetRole !== 'admin';
+  }
+  if (currentRole === 'moderator') {
+    return targetRole === 'user';
+  }
+  return false;
+}
+
+function getAvailableRoles(currentRole: Role): Role[] {
+  if (currentRole === 'super_admin') {
+    return ['super_admin', 'admin', 'moderator', 'user'];
+  }
+  if (currentRole === 'admin') {
+    return ['moderator', 'user'];
+  }
+  if (currentRole === 'moderator') {
+    return ['user'];
+  }
+  return [];
+}
+
 const Dashboard = () => {
   const auth = useAuth();
   const [users, setUsers] = useState<AppUser[]>([]);
@@ -20,25 +66,40 @@ const Dashboard = () => {
   const usersPerPage = 5;
 
   const fetchUsers = React.useCallback(async () => {
-    setLoading(true);
-    try {
-      if (!auth?.user) {
-        toast.error('Not authenticated');
-        return;
-      }
+    if (!auth?.user || auth.loading) {
+      return; // Don't fetch if user is not authenticated or still loading
+    }
 
+    // Only show loading on initial load, not on subsequent updates
+    if (users.length === 0) {
+      setLoading(true);
+    }
+
+    try {
       // Get the current session to pass as authorization
       const { data: { session } } = await supabase.auth.getSession();
       
+      if (!session?.access_token) {
+        console.log('No session found, user might not be authenticated');
+        return;
+      }
+      
       const response = await fetch('/api/admin/users', {
         headers: {
-          'Authorization': `Bearer ${session?.access_token}`,
+          'Authorization': `Bearer ${session.access_token}`,
         },
       });
       const result = await response.json();
       
       if (!response.ok) {
-        toast.error(result.error || 'Failed to fetch users');
+        if (response.status === 401) {
+          console.log('Unauthorized - session might be expired');
+          return;
+        }
+        // Only show error toast if it's not just a refresh
+        if (users.length === 0) {
+          toast.error(result.error || 'Failed to fetch users');
+        }
         console.error('Error fetching users:', result.error);
       } else if (result.users) {
         setUsers(result.users);
@@ -46,15 +107,68 @@ const Dashboard = () => {
         console.log('Fetched users:', result.users); // Debug log
       }
     } catch (err) {
-      toast.error('An unexpected error occurred');
+      // Only show error toast if it's not just a refresh
+      if (users.length === 0) {
+        toast.error('An unexpected error occurred');
+      }
       console.error('Unexpected error:', err);
     }
     setLoading(false);
-  }, [auth?.user]);
+  }, [auth?.user, auth?.loading, users.length]);
 
   useEffect(() => {
     fetchUsers();
-  }, [auth?.user]);
+
+    // Set up real-time subscription for rbac_users table
+    const subscription = supabase
+      .channel('rbac_users_changes')
+      .on('postgres_changes', 
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'rbac_users' 
+        }, 
+        (payload) => {
+          console.log('Real-time update received:', payload);
+          
+          if (payload.eventType === 'UPDATE') {
+            // Update the specific user in the list
+            setUsers(prevUsers => 
+              prevUsers.map(user => 
+                user.id === payload.new.id 
+                  ? { ...user, ...payload.new }
+                  : user
+              )
+            );
+            
+            // If the updated user is the current user, refresh their auth data and role
+            if (auth?.user?.id === payload.new.id) {
+              console.log('Current user role updated via real-time:', payload.new.role);
+              setCurrentUserRole(payload.new.role);
+              // Refresh auth context to update session data
+              auth?.refreshUser?.();
+            }
+          } else if (payload.eventType === 'DELETE') {
+            // Remove the deleted user from the list
+            setUsers(prevUsers => 
+              prevUsers.filter(user => user.id !== payload.old.id)
+            );
+          } else if (payload.eventType === 'INSERT') {
+            // Add the new user to the list (type cast for compatibility)
+            const newUser = payload.new as AppUser;
+            setUsers(prevUsers => [...prevUsers, newUser]);
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log('Realtime subscription status:', status);
+      });
+
+    return () => {
+      console.log('Unsubscribing from realtime');
+      subscription.unsubscribe();
+    };
+  }, [auth, fetchUsers]);
 
   const filteredUsers = users
     .filter((u) => u.email.toLowerCase().includes(search.toLowerCase()))
@@ -65,31 +179,85 @@ const Dashboard = () => {
   const currentUsers = filteredUsers.slice(indexOfFirstUser, indexOfLastUser);
 
   const handleRoleChange = async (userId: string, newRole: Role) => {
+    console.log(`Attempting to change user ${userId} role to ${newRole}`);
+    
+    // Check if current user has permission to assign this role
+    if (!canManageRole(currentUserRole, newRole)) {
+      toast.error(`You don't have permission to assign ${newRole} role`);
+      return;
+    }
+
+    // Prevent changing own role for admins (only super admin can change admin roles)
+    if (userId === auth?.user?.id && currentUserRole === 'admin' && newRole !== 'admin') {
+      toast.error('Admins cannot change their own role');
+      return;
+    }
+
+    // Optimistic update - update UI immediately
+    const previousUsers = users;
+    const previousRole = currentUserRole;
+    
+    setUsers(prevUsers => 
+      prevUsers.map(user => 
+        user.id === userId 
+          ? { ...user, role: newRole }
+          : user
+      )
+    );
+
+    // If the current user's role is being changed, update it immediately
+    if (auth?.user?.id === userId) {
+      setCurrentUserRole(newRole);
+    }
+
     try {
-      // Get the current session to pass as authorization
-      const { data: { session } } = await supabase.auth.getSession();
+      // Get fresh session to ensure we have a valid token
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
       
+      if (sessionError || !session?.access_token) {
+        throw new Error('No valid session found');
+      }
+
+      console.log('Making API call to update role...');
       const response = await fetch('/api/admin/users', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session?.access_token}`,
+          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({ userId, role: newRole }),
       });
       
       const result = await response.json();
+      console.log('API response:', { status: response.status, result });
       
       if (!response.ok) {
+        console.error('API error:', result);
+        // Revert optimistic updates on error
+        setUsers(previousUsers);
+        setCurrentUserRole(previousRole);
         toast.error(result.error || 'Failed to update user role');
-        console.error('Error updating role:', result.error);
       } else {
+        console.log('Role updated successfully');
         toast.success('User role updated successfully');
-        fetchUsers();
+        
+        // If the current user's role was changed, refresh their auth data immediately
+        if (auth?.user?.id === userId) {
+          console.log('Refreshing current user auth data...');
+          await auth?.refreshUser?.();
+        }
+        
+        // Force a fresh fetch to ensure consistency
+        setTimeout(() => {
+          fetchUsers();
+        }, 500);
       }
     } catch (err) {
+      console.error('Error updating role:', err);
+      // Revert optimistic updates on error
+      setUsers(previousUsers);
+      setCurrentUserRole(previousRole);
       toast.error('An unexpected error occurred');
-      console.error('Unexpected error:', err);
     }
   };
 
@@ -114,8 +282,8 @@ const Dashboard = () => {
         console.error('Error deleting user:', result.error);
       } else {
         toast.success('User deleted successfully');
-        fetchUsers();
         setDeleteConfirm(null);
+        // Real-time subscription will handle the refresh automatically
       }
     } catch (err) {
       toast.error('An unexpected error occurred');
@@ -129,7 +297,9 @@ const Dashboard = () => {
         <Navbar />
         <div className="max-w-6xl mx-auto p-6">
           <h1 className="text-3xl font-bold mb-6 text-gray-800">
-            {currentUserRole === 'admin' ? 'Admin' : currentUserRole === 'moderator' ? 'Moderator' : 'User'} Dashboard
+            {currentUserRole === 'super_admin' ? 'Super Admin' : 
+             currentUserRole === 'admin' ? 'Admin' : 
+             currentUserRole === 'moderator' ? 'Moderator' : 'User'} Dashboard
           </h1>
 
           {/* Filters */}
@@ -147,9 +317,10 @@ const Dashboard = () => {
               className="px-4 py-2 bg-blue-500 border border-gray-300 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
               <option value="">All Roles</option>
+              <option value="super_admin">Super Admin</option>
               <option value="admin">Admin</option>
-              <option value="user">User</option>
               <option value="moderator">Moderator</option>
+              <option value="user">User</option>
             </select>
           </div>
 
@@ -191,18 +362,39 @@ const Dashboard = () => {
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap">
                           <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                            user.role === 'admin' 
+                            user.role === 'super_admin'
+                              ? 'bg-purple-100 text-purple-800'
+                              : user.role === 'admin' 
                               ? 'bg-red-100 text-red-800'
                               : user.role === 'moderator'
                               ? 'bg-yellow-100 text-yellow-800'
                               : 'bg-green-100 text-green-800'
                           }`}>
-                            {user.role}
+                            {user.role === 'super_admin' ? 'Super Admin' : 
+                             user.role === 'admin' ? 'Admin' :
+                             user.role === 'moderator' ? 'Moderator' : 'User'}
                           </span>
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        <td className="px-6 py-4 text-gray-500 whitespace-nowrap text-sm font-medium">
                           <div className="flex items-center gap-2">
-                            {/* Only admins can change roles */}
+                            {/* Super Admin can change any role */}
+                            {currentUserRole === 'super_admin' && (
+                              <select
+                                value={user.role}
+                                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => 
+                                  handleRoleChange(user.id, e.target.value as Role)
+                                }
+                                className="px-3 py-1 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
+                                disabled={user.id === auth?.user?.id} // Can't change own role
+                              >
+                                <option value="super_admin">Super Admin</option>
+                                <option value="admin">Admin</option>
+                                <option value="moderator">Moderator</option>
+                                <option value="user">User</option>
+                              </select>
+                            )}
+
+                            {/* Admins can change roles except super admin and other admins */}
                             {currentUserRole === 'admin' && (
                               <select
                                 value={user.role}
@@ -210,14 +402,16 @@ const Dashboard = () => {
                                   handleRoleChange(user.id, e.target.value as Role)
                                 }
                                 className="px-3 py-1 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
+                                disabled={user.role === 'super_admin' || (user.role === 'admin' && user.id !== auth?.user?.id)}
                               >
-                                <option value="admin">Admin</option>
-                                <option value="user">User</option>
+                                <option value="super_admin" disabled>Super Admin</option>
+                                <option value="admin" disabled={user.id !== auth?.user?.id}>Admin</option>
                                 <option value="moderator">Moderator</option>
+                                <option value="user">User</option>
                               </select>
                             )}
                             
-                            {/* Moderators can see roles but can't change to admin */}
+                            {/* Moderators can only change user roles */}
                             {currentUserRole === 'moderator' && (
                               <select
                                 value={user.role}
@@ -225,11 +419,12 @@ const Dashboard = () => {
                                   handleRoleChange(user.id, e.target.value as Role)
                                 }
                                 className="px-3 py-1 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
-                                disabled={user.role === 'admin'} // Can't change admin roles
+                                disabled={user.role !== 'user'}
                               >
+                                <option value="super_admin" disabled>Super Admin</option>
                                 <option value="admin" disabled>Admin</option>
+                                <option value="moderator" disabled>Moderator</option>
                                 <option value="user">User</option>
-                                <option value="moderator">Moderator</option>
                               </select>
                             )}
                             
@@ -240,11 +435,17 @@ const Dashboard = () => {
                               </span>
                             )}
                             
-                            {/* Only admins can delete users */}
-                            {currentUserRole === 'admin' && (
+                            {/* Super Admin and Admin can delete users (with restrictions) */}
+                            {(currentUserRole === 'super_admin' || currentUserRole === 'admin') && 
+                             canManageRole(currentUserRole, user.role) && 
+                             user.id !== auth?.user?.id && (
                               <button
                                 onClick={() => setDeleteConfirm(user.id)}
                                 className="px-3 py-1 bg-red-500 text-white rounded text-sm hover:bg-red-600 transition-colors"
+                                disabled={
+                                  (currentUserRole === 'admin' && (user.role === 'super_admin' || user.role === 'admin')) ||
+                                  user.id === auth?.user?.id
+                                }
                               >
                                 Delete
                               </button>
@@ -311,7 +512,7 @@ const Dashboard = () => {
             </div>
           </div>
         )}
-      </div>
+        </div>
     </Protected>
   );
 };
