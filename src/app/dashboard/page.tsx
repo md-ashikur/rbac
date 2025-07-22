@@ -1,13 +1,17 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { AppUser, Role } from '@/types';
 import Navbar from '@/components/navbar';
 import Protected from '@/components/protected';
 import toast from 'react-hot-toast';
+import { useAuth } from '@/components/auth-provider';
+import { supabase } from '@/lib/supabase';
 
 const Dashboard = () => {
+  const auth = useAuth();
   const [users, setUsers] = useState<AppUser[]>([]);
+  const [currentUserRole, setCurrentUserRole] = useState<Role>('user');
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState<Role | ''>('');
@@ -15,18 +19,30 @@ const Dashboard = () => {
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const usersPerPage = 5;
 
-  const fetchUsers = async () => {
+  const fetchUsers = React.useCallback(async () => {
     setLoading(true);
     try {
-      // Use API route for admin operations to bypass RLS
-      const response = await fetch('/api/admin/users');
+      if (!auth?.user) {
+        toast.error('Not authenticated');
+        return;
+      }
+
+      // Get the current session to pass as authorization
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      const response = await fetch('/api/admin/users', {
+        headers: {
+          'Authorization': `Bearer ${session?.access_token}`,
+        },
+      });
       const result = await response.json();
       
       if (!response.ok) {
-        toast.error('Failed to fetch users');
+        toast.error(result.error || 'Failed to fetch users');
         console.error('Error fetching users:', result.error);
       } else if (result.users) {
         setUsers(result.users);
+        setCurrentUserRole(result.currentUserRole);
         console.log('Fetched users:', result.users); // Debug log
       }
     } catch (err) {
@@ -34,11 +50,11 @@ const Dashboard = () => {
       console.error('Unexpected error:', err);
     }
     setLoading(false);
-  };
+  }, [auth?.user]);
 
   useEffect(() => {
     fetchUsers();
-  }, []);
+  }, [auth?.user]);
 
   const filteredUsers = users
     .filter((u) => u.email.toLowerCase().includes(search.toLowerCase()))
@@ -50,10 +66,14 @@ const Dashboard = () => {
 
   const handleRoleChange = async (userId: string, newRole: Role) => {
     try {
+      // Get the current session to pass as authorization
+      const { data: { session } } = await supabase.auth.getSession();
+      
       const response = await fetch('/api/admin/users', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`,
         },
         body: JSON.stringify({ userId, role: newRole }),
       });
@@ -61,7 +81,7 @@ const Dashboard = () => {
       const result = await response.json();
       
       if (!response.ok) {
-        toast.error('Failed to update user role');
+        toast.error(result.error || 'Failed to update user role');
         console.error('Error updating role:', result.error);
       } else {
         toast.success('User role updated successfully');
@@ -75,10 +95,14 @@ const Dashboard = () => {
 
   const handleDelete = async (userId: string) => {
     try {
+      // Get the current session to pass as authorization
+      const { data: { session } } = await supabase.auth.getSession();
+      
       const response = await fetch('/api/admin/users', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`,
         },
         body: JSON.stringify({ userId }),
       });
@@ -86,7 +110,7 @@ const Dashboard = () => {
       const result = await response.json();
       
       if (!response.ok) {
-        toast.error('Failed to delete user');
+        toast.error(result.error || 'Failed to delete user');
         console.error('Error deleting user:', result.error);
       } else {
         toast.success('User deleted successfully');
@@ -100,11 +124,13 @@ const Dashboard = () => {
   };
 
   return (
-    <Protected role="admin">
+    <Protected>
       <div className="min-h-screen bg-gray-100">
         <Navbar />
         <div className="max-w-6xl mx-auto p-6">
-          <h1 className="text-3xl font-bold mb-6 text-gray-800">Admin Dashboard</h1>
+          <h1 className="text-3xl font-bold mb-6 text-gray-800">
+            {currentUserRole === 'admin' ? 'Admin' : currentUserRole === 'moderator' ? 'Moderator' : 'User'} Dashboard
+          </h1>
 
           {/* Filters */}
           <div className="flex flex-col md:flex-row gap-4 mb-6">
@@ -176,23 +202,53 @@ const Dashboard = () => {
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
                           <div className="flex items-center gap-2">
-                            <select
-                              value={user.role}
-                              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => 
-                                handleRoleChange(user.id, e.target.value as Role)
-                              }
-                              className="px-3 py-1 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
-                            >
-                              <option value="admin">Admin</option>
-                              <option value="user">User</option>
-                              <option value="moderator">Moderator</option>
-                            </select>
-                            <button
-                              onClick={() => setDeleteConfirm(user.id)}
-                              className="px-3 py-1 bg-red-500 text-white rounded text-sm hover:bg-red-600 transition-colors"
-                            >
-                              Delete
-                            </button>
+                            {/* Only admins can change roles */}
+                            {currentUserRole === 'admin' && (
+                              <select
+                                value={user.role}
+                                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => 
+                                  handleRoleChange(user.id, e.target.value as Role)
+                                }
+                                className="px-3 py-1 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
+                              >
+                                <option value="admin">Admin</option>
+                                <option value="user">User</option>
+                                <option value="moderator">Moderator</option>
+                              </select>
+                            )}
+                            
+                            {/* Moderators can see roles but can't change to admin */}
+                            {currentUserRole === 'moderator' && (
+                              <select
+                                value={user.role}
+                                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => 
+                                  handleRoleChange(user.id, e.target.value as Role)
+                                }
+                                className="px-3 py-1 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
+                                disabled={user.role === 'admin'} // Can't change admin roles
+                              >
+                                <option value="admin" disabled>Admin</option>
+                                <option value="user">User</option>
+                                <option value="moderator">Moderator</option>
+                              </select>
+                            )}
+                            
+                            {/* Regular users can only view roles */}
+                            {currentUserRole === 'user' && (
+                              <span className="px-3 py-1 text-sm text-gray-600">
+                                View Only
+                              </span>
+                            )}
+                            
+                            {/* Only admins can delete users */}
+                            {currentUserRole === 'admin' && (
+                              <button
+                                onClick={() => setDeleteConfirm(user.id)}
+                                className="px-3 py-1 bg-red-500 text-white rounded text-sm hover:bg-red-600 transition-colors"
+                              >
+                                Delete
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
